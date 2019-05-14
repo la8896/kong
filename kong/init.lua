@@ -514,7 +514,8 @@ function Kong.ssl_certificate()
 
   runloop.certificate.before(mock_ctx)
 
-  local ok, err = runloop.update_plugins_iterator()
+  local timeout = runloop.get_rebuild_timeout()
+  local ok, err = runloop.rebuild_plugins_iterator(timeout)
   if not ok then
     ngx_log(ngx_CRIT, "could not ensure plugins iterator is up to date: ", err)
     return ngx.exit(ngx.ERROR)
@@ -629,7 +630,9 @@ function Kong.rewrite()
 
   -- On HTTPS requests, the plugins iterator is already updated in the ssl_certificate phase
   if ngx.var.https ~= "on" then
-    local ok, err = runloop.update_plugins_iterator()
+
+    local timeout = runloop.get_rebuild_timeout()
+    local ok, err = runloop.rebuild_plugins_iterator(timeout)
     if not ok then
       ngx_log(ngx_CRIT, "could not ensure plugins iterator is up to date: ", err)
       return kong.response.exit(500, { message  = "An unexpected error occurred" })
@@ -648,7 +651,8 @@ function Kong.preread()
 
   runloop.preread.before(ctx)
 
-  local ok, err = runloop.update_plugins_iterator()
+  local timeout = runloop.get_rebuild_timeout()
+  local ok, err = runloop.rebuild_plugins_iterator(timeout)
   if not ok then
     ngx_log(ngx_CRIT, "could not ensure plugins iterator is up to date: ", err)
     return kong.response.exit(500, { message  = "An unexpected error occurred" })
@@ -735,7 +739,9 @@ function Kong.handle_error()
   ctx.KONG_UNEXPECTED = true
 
   if not ctx.plugins then
-    runloop.update_plugins_iterator()
+
+    local timeout = runloop.get_rebuild_timeout()
+    runloop.rebuild_plugins_iterator(timeout) -- ignore error
     local plugins_iterator = runloop.get_plugins_iterator()
     for _ in plugins_iterator:iterate(ctx, "content") do
       -- just build list of plugins
