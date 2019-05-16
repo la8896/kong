@@ -36,6 +36,9 @@ local function setup_it_block()
           return "1"
         end
       },
+      db = {
+        strategy = "dummy",
+      }
     },
 
     modules = {

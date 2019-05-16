@@ -48,6 +48,8 @@ local subsystem    = ngx.config.subsystem
 local start_time   = ngx.req.start_time
 local clear_header = ngx.req.clear_header
 local starttls     = ngx.req.starttls -- luacheck: ignore
+local sleep        = ngx.sleep
+local worker_id    = ngx.worker.id
 local unpack       = unpack
 
 
@@ -64,6 +66,7 @@ local CACHE_ROUTER_OPTS = { ttl = 0 }
 local SUBSYSTEMS = constants.PROTOCOLS_WITH_SUBSYSTEM
 local EMPTY_T = {}
 local TTL_ZERO = { ttl = 0 }
+local WORKER_ID
 
 
 local get_plugins_iterator, build_plugins_iterator, update_plugins_iterator
@@ -382,6 +385,20 @@ local function get_rebuild_timeout()
 end
 
 
+local function get_version(name)
+  if not kong.cache then
+    return "init"
+  end
+
+  local version, err = kong.cache:get(name .. ":version", TTL_ZERO, utils.uuid)
+  if err then
+    return nil, "could not ensure " .. name .. " is up to date: " .. err
+  end
+
+  return version
+end
+
+
 local rebuild
 do
   local function acquire_semaphore(semaphore, wait)
@@ -405,35 +422,50 @@ do
   end
 
 
-  local function get_version(name)
-    if not kong.cache then
-      return "init"
+  local function log_with_worker_id(level, message)
+    if WORKER_ID then
+      log(level, message, " (worker id: ", WORKER_ID, ")")
+    else
+      log(level, message)
     end
-
-    local version, err = kong.cache:get(name .. ":version", TTL_ZERO, utils.uuid)
-    if err then
-      return nil, "could not ensure " .. name .. " is up to date: " .. err
-    end
-
-    return version
   end
 
 
-  local function safe_rebuild(callback, version)
-    local pok, ok, err = pcall(callback, version)
-    if not pok or not ok then
-      return nil, "could not rebuild synchronously: " .. tostring(ok or err)
+  local function safe_rebuild(name, callback, version)
+    local max_attempts = 6
+    local success = false
+
+    local action = version == "init" and "initializing" or "rebuilding"
+
+    for attempt = 1, max_attempts do
+      log_with_worker_id(DEBUG,
+        fmt("%s %s. Attempt %d/%d", action, name, attempt, max_attempts))
+      local pok, ok, err = pcall(callback, version)
+      if pok and ok then
+        log_with_worker_id(DEBUG, fmt("%s %s succeeded", action, name))
+        success = true
+        break
+      end
+
+      log_with_worker_id(NOTICE, fmt("%s %s failed: %s", action, name, ok or err))
+      sleep(0.01 * attempt * attempt)
     end
-    return true
+
+    if not success then
+      return nil, fmt("%s %s failed %s times, aborting",
+                      action, name, max_attempts)
+    end
+
+    return success
   end
 
 
-  local function rebuild_timer(premature, callback, version, semaphore)
+  local function rebuild_timer(premature, name, callback, version, semaphore)
     if premature then
       release_semaphore(semaphore)
       return
     end
-    local ok, err = safe_rebuild(callback, version)
+    local ok, err = safe_rebuild(name, callback, version)
     if not ok then
       log(CRIT, err)
     end
@@ -441,8 +473,8 @@ do
   end
 
 
-  local function rebuild_async(callback, version, semaphore)
-    local ok, err = timer_at(0, rebuild_timer, callback, version, semaphore)
+  local function rebuild_async(name, callback, version, semaphore)
+    local ok, err = timer_at(0, rebuild_timer, name, callback, version, semaphore)
     if not ok then
       return nil, "could not create rebuild timer: " .. err
     end
@@ -478,7 +510,7 @@ do
     if not ok then
       if wait and wait > 0 then
         log(NOTICE, "could not acquire semaphore, attempting sync rebuild")
-        local ok, err = safe_rebuild(callback, current_version)
+        local ok, err = safe_rebuild(name, callback, current_version)
         if not ok then
           return nil, err
         end
@@ -499,18 +531,18 @@ do
     end
 
     if wait and wait > 0 then
-      local ok, err = safe_rebuild(callback, current_version)
+      local ok, err = safe_rebuild(name, callback, current_version)
       release_semaphore(semaphore)
       return ok, err
 
     else
-      ok, err = rebuild_async(callback, current_version, semaphore)
+      ok, err = rebuild_async(name, callback, current_version, semaphore)
       if not ok then
         if wait and wait == 0 then
           log(NOTICE, "could not rebuild asynchronously:",
                        err,
                        ", attempting synchronous rebuild")
-          local ok, err = safe_rebuild(callback, current_version)
+          local ok, err = safe_rebuild(name, callback, current_version)
           release_semaphore(semaphore)
           return ok, err
         end
@@ -664,6 +696,7 @@ do
     return service
   end
 
+
   build_router = function(version)
     local db = kong.db
     local routes, i = {}, 0
@@ -680,9 +713,17 @@ do
       end
     end
 
+    local counter = 0
     for route, err in db.routes:each(1000) do
       if err then
         return nil, "could not load routes: " .. err
+      end
+
+      if counter % 1000 then
+        local current_version = get_version("router")
+        if version ~= current_version then
+          return nil, "router version updated while rebuilding"
+        end
       end
 
       if should_process_route(route) then
@@ -713,6 +754,7 @@ do
         i = i + 1
         routes[i] = r
       end
+      counter = counter + 1
     end
 
     sort(routes, function(r1, r2)
@@ -880,6 +922,7 @@ return {
 
   init_worker = {
     before = function()
+      WORKER_ID = worker_id()
       reports.init_worker()
       update_lua_mem(true)
 
